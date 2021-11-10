@@ -4,16 +4,24 @@ declare(strict_types=1);
 
 namespace Shopware\Production\Command;
 
+use Shopware\Core\DevOps\Environment\EnvironmentHelper;
 use Doctrine\DBAL\Configuration;
 use Doctrine\DBAL\DriverManager;
 use Shopware\Core\Framework\Adapter\Console\ShopwareStyle;
+use Shopware\Core\Maintenance\System\Service\DatabaseConnectionFactory;
+use Shopware\Core\Maintenance\System\Service\DatabaseInitializer;
+use Shopware\Core\Maintenance\System\Struct\DatabaseConnectionInformation;
 use Shopware\Core\Kernel as CoreKernel;
+use Symfony\Component\Console\Application;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\ArrayInput;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 
+/**
+ * @internal should be used over the CLI only
+ */
 class SystemInstallCommand extends Command
 {
     public static $defaultName = 'system:install';
@@ -28,11 +36,16 @@ class SystemInstallCommand extends Command
 
     protected function configure(): void
     {
-        $this->addOption('create-database', null, InputOption::VALUE_NONE, "Create database if it doesn't exist.")
+        $this->addOption('create-database', null, InputOption::VALUE_NONE, 'Create database if it doesn\'t exist.')
             ->addOption('drop-database', null, InputOption::VALUE_NONE, 'Drop existing database')
             ->addOption('basic-setup', null, InputOption::VALUE_NONE, 'Create storefront sales channel and admin user')
             ->addOption('force', 'f', InputOption::VALUE_NONE, 'Force install even if install.lock exists')
-            ->addOption('no-assign-theme', null, InputOption::VALUE_NONE, 'Do not assign the default theme');
+            ->addOption('no-assign-theme', null, InputOption::VALUE_NONE, 'Do not assign the default theme')
+            ->addOption('shop-name', null, InputOption::VALUE_REQUIRED, 'The name of your shop')
+            ->addOption('shop-email', null, InputOption::VALUE_REQUIRED, 'Shop email address')
+            ->addOption('shop-locale', null, InputOption::VALUE_REQUIRED, 'Default language locale of the shop')
+            ->addOption('shop-currency', null, InputOption::VALUE_REQUIRED, 'Iso code for the default currency of the shop')
+        ;
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
@@ -40,93 +53,23 @@ class SystemInstallCommand extends Command
         $output = new ShopwareStyle($input, $output);
 
         // set default
-        $_ENV['BLUE_GREEN_DEPLOYMENT'] = $_SERVER['BLUE_GREEN_DEPLOYMENT']
-            = $_ENV['BLUE_GREEN_DEPLOYMENT']
-            ?? $_SERVER['BLUE_GREEN_DEPLOYMENT']
-            ?? '1';
-        putenv('BLUE_GREEN_DEPLOYMENT=' . $_SERVER['BLUE_GREEN_DEPLOYMENT']);
-
-        $dsn = trim((string) ($_ENV['DATABASE_URL'] ?? $_SERVER['DATABASE_URL'] ?? getenv('DATABASE_URL')));
-        if ($dsn === '') {
-            $output->error("Environment variable 'DATABASE_URL' not defined.");
-
-            return 1;
-        }
+        $isBlueGreen = EnvironmentHelper::getVariable('BLUE_GREEN_DEPLOYMENT', '1');
+        $_ENV['BLUE_GREEN_DEPLOYMENT'] = $_SERVER['BLUE_GREEN_DEPLOYMENT'] = $isBlueGreen;
+        putenv('BLUE_GREEN_DEPLOYMENT=' . $isBlueGreen);
 
         if (!$input->getOption('force') && file_exists($this->projectDir . '/install.lock')) {
             $output->comment('install.lock already exists. Delete it or pass --force to do it anyway.');
 
-            return 1;
+            return self::FAILURE;
         }
 
-        $params = parse_url($dsn);
-        if ($params === false) {
-            $output->error('dsn invalid');
-
-            return 1;
-        }
-
-        $path = $params['path'] ?? '/';
-        $dbName = substr($path, 1);
-
-        $dsnWithoutDb = sprintf(
-            '%s://%s%s:%s',
-            $params['scheme'],
-            isset($params['pass'], $params['user']) ? ($params['user'] . ':' . $params['pass'] . '@') : '',
-            $params['host'],
-            $params['port'] ?? 3306
-        );
-
-        $parameters = [
-            'url' => $dsnWithoutDb,
-            'charset' => 'utf8mb4',
-        ];
-
-        if (isset($_ENV['DATABASE_SSL_CA'])) {
-            $parameters['driverOptions'][\PDO::MYSQL_ATTR_SSL_CA] = $_ENV['DATABASE_SSL_CA'];
-        }
-
-        if (isset($_ENV['DATABASE_SSL_CERT'])) {
-            $parameters['driverOptions'][\PDO::MYSQL_ATTR_SSL_CERT] = $_ENV['DATABASE_SSL_CERT'];
-        }
-
-        if (isset($_ENV['DATABASE_SSL_KEY'])) {
-            $parameters['driverOptions'][\PDO::MYSQL_ATTR_SSL_KEY] = $_ENV['DATABASE_SSL_KEY'];
-        }
-
-        if (isset($_ENV['DATABASE_SSL_DONT_VERIFY_SERVER_CERT'])) {
-            $parameters['driverOptions'][\PDO::MYSQL_ATTR_SSL_VERIFY_SERVER_CERT] = false;
-        }
-
-        $connection = DriverManager::getConnection($parameters, new Configuration());
-
-        $output->writeln('Prepare installation');
-        $output->writeln('');
-
-        $dropDatabase = $input->getOption('drop-database');
-        if ($dropDatabase) {
-            $connection->executeStatement('DROP DATABASE IF EXISTS `' . $dbName . '`');
-            $output->writeln('Drop database `' . $dbName . '`');
-        }
-
-        $createDatabase = $input->getOption('create-database') || $dropDatabase;
-        if ($createDatabase) {
-            $connection->executeStatement('CREATE DATABASE IF NOT EXISTS `' . $dbName . '` CHARACTER SET `utf8mb4` COLLATE `utf8mb4_unicode_ci`');
-            $output->writeln('Created database `' . $dbName . '`');
-        }
-
-        $connection->executeStatement('USE `' . $dbName . '`');
-
-        $tables = $connection->executeQuery('SHOW TABLES')->fetchAll(\PDO::FETCH_COLUMN);
-
-        if (!\in_array('migration', $tables, true)) {
-            $output->writeln('Importing base schema.sql');
-            $connection->executeStatement($this->getBaseSchema());
-        }
-
-        $output->writeln('');
+        $this->initializeDatabase($output, $input);
 
         $commands = [
+            [
+                'command' => 'system:generate-jwt',
+                'allowedToFail' => true,
+            ],
             [
                 'command' => 'database:migrate',
                 'identifier' => 'core',
@@ -139,16 +82,38 @@ class SystemInstallCommand extends Command
                 '--version-selection-mode' => 'all',
             ],
             [
+                'command' => 'system:configure-shop',
+                '--shop-name' => $input->getOption('shop-name'),
+                '--shop-email' => $input->getOption('shop-email'),
+                '--shop-locale' => $input->getOption('shop-locale'),
+                '--shop-currency' => $input->getOption('shop-currency'),
+                '--no-interaction' => true,
+            ],
+            [
                 'command' => 'dal:refresh:index',
             ],
             [
-                'command' => 'theme:refresh',
+                'command' => 'scheduled-task:register',
             ],
             [
-                'command' => 'theme:compile',
-                'allowedToFail' => true,
+                'command' => 'plugin:refresh',
             ],
         ];
+
+        /** @var Application $application */
+        $application = $this->getApplication();
+        if ($application->has('theme:refresh')) {
+            $commands[] = [
+                'command' => 'theme:refresh',
+            ];
+        }
+
+        if ($application->has('theme:compile')) {
+            $commands[] = [
+                'command' => 'theme:compile',
+                'allowedToFail' => true,
+            ];
+        }
 
         if ($input->getOption('basic-setup')) {
             $commands[] = [
@@ -158,13 +123,15 @@ class SystemInstallCommand extends Command
                 '--password' => 'shopware',
             ];
 
-            $commands[] = [
-                'command' => 'sales-channel:create:storefront',
-                '--name' => 'Storefront',
-                '--url' => $_SERVER['APP_URL'] ?? 'http://localhost',
-            ];
+            if ($application->has('sales-channel:create:storefront')) {
+                $commands[] = [
+                    'command' => 'sales-channel:create:storefront',
+                    '--name' => $input->getOption('shop-name') ?? 'Storefront',
+                    '--url' => (string) EnvironmentHelper::getVariable('APP_URL', 'http://localhost'),
+                ];
+            }
 
-            if (!$input->getOption('no-assign-theme')) {
+            if ($application->has('theme:change') && !$input->getOption('no-assign-theme')) {
                 $commands[] = [
                     'command' => 'theme:change',
                     'allowedToFail' => true,
@@ -174,11 +141,12 @@ class SystemInstallCommand extends Command
             }
         }
 
-        array_push($commands, [
+        $commands[] = [
             'command' => 'assets:install',
-        ], [
+        ];
+        $commands[] = [
             'command' => 'cache:clear',
-        ]);
+        ];
 
         $this->runCommands($commands, $output);
 
@@ -190,11 +158,11 @@ class SystemInstallCommand extends Command
 
         touch($this->projectDir . '/install.lock');
 
-        return 0;
+        return self::SUCCESS;
     }
 
     /**
-     * @param array<int, array<string, string|bool>> $commands
+     * @param array<int, array<string, string|bool|null>> $commands
      */
     private function runCommands(array $commands, OutputInterface $output): int
     {
@@ -204,6 +172,9 @@ class SystemInstallCommand extends Command
         }
 
         foreach ($commands as $parameters) {
+            // remove params with null value
+            $parameters = array_filter($parameters);
+
             $output->writeln('');
 
             $command = $application->find((string) $parameters['command']);
@@ -222,19 +193,38 @@ class SystemInstallCommand extends Command
             }
         }
 
-        return 0;
+        return self::SUCCESS;
     }
 
-    private function getBaseSchema(): string
+    private function initializeDatabase(ShopwareStyle $output, InputInterface $input): void
     {
-        $kernelClass = new \ReflectionClass(CoreKernel::class);
-        $directory = \dirname((string) $kernelClass->getFileName());
+        $databaseConnectionInformation = DatabaseConnectionInformation::fromEnv();
 
-        $path = $directory . '/schema.sql';
-        if (!is_readable($path) || is_dir($path)) {
-            throw new \RuntimeException('schema.sql not found or readable in ' . $directory);
+        $connection = DatabaseConnectionFactory::createConnection($databaseConnectionInformation, true);
+
+        $output->writeln('Prepare installation');
+        $output->writeln('');
+
+        $databaseInitializer = new DatabaseInitializer($connection);
+
+        $dropDatabase = $input->getOption('drop-database');
+        if ($dropDatabase) {
+            $databaseInitializer->dropDatabase($databaseConnectionInformation->getDatabaseName());
+            $output->writeln('Drop database `' . $databaseConnectionInformation->getDatabaseName() . '`');
         }
 
-        return (string) file_get_contents($path);
+        $createDatabase = $input->getOption('create-database') || $dropDatabase;
+        if ($createDatabase) {
+            $databaseInitializer->createDatabase($databaseConnectionInformation->getDatabaseName());
+            $output->writeln('Created database `' . $databaseConnectionInformation->getDatabaseName() . '`');
+        }
+
+        $importedBaseSchema = $databaseInitializer->initializeShopwareDb($databaseConnectionInformation->getDatabaseName());
+
+        if ($importedBaseSchema) {
+            $output->writeln('Imported base schema.sql');
+        }
+
+        $output->writeln('');
     }
 }
